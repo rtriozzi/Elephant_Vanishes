@@ -20,6 +20,7 @@
 #include "PROversion.h"
 #include "PROplot.h"
 #include "PRObench.h"
+#include "PROratio.h"
 
 #include "CLI11.h"
 #include "LBFGSB.h"
@@ -362,6 +363,16 @@ int main(int argc, char* argv[])
     auto* rate_flag = app.add_flag("--rateonly", rateonly, "Run a rate only analysis");
     shape_flag->excludes(rate_flag);   
 
+    std::vector<std::string> fit_ratio_args;
+    int fit_ratio_var = -1;
+    app.add_option("--fit-ratio", fit_ratio_args,
+        "Fit the ratio between channels instead of the per-channel variable. Takes "
+        "pairs of <mode>_<detector>_<channel> names, numerator first. Repeatable: "
+        "the fit observable is the concatenation of all requested ratios. Example: "
+        "--fit-ratio nu_ICARUS_nue nu_ICARUS_numu")->expected(-1);
+    app.add_option("--fit-ratio-var", fit_ratio_var,
+        "Variable index for --fit-ratio. Defaults to i_prime.")->default_val(-1);
+
     //PROcess, into binary data [Do this once first!]
     CLI::App *process_command = app.add_subcommand("process", "PROcess the MC and systematics in root files into binary data for future rapid loading.");
 
@@ -403,6 +414,11 @@ int main(int argc, char* argv[])
         "systematic uncertainty on the background continues to appear in the "
         "band. Example: --bkg-subtract numu_bkg matches every "
         "<detector>_numu_bkg subchannel.");
+    bool plot_channel_ratios = false;
+    proplot_command->add_flag("--plot-ratios", plot_channel_ratios,
+        "Also draw channel-to-channel ratio spectra within each detector. The two "
+        "channels must share the same binning for the ratio to be defined; pairs "
+        "with different binning are skipped and logged as a warning.");
 
     //PROfc, Feldmand-Cousins
     CLI::App *profc_command = app.add_subcommand("fc", "Run Feldman-Cousins for this injected signal");
@@ -463,9 +479,6 @@ int main(int argc, char* argv[])
 
     log<LOG_WARNING>(L" %1% ") % getIcon().c_str()  ;
     std::string final_output_tag =analysis_tag +"_"+output_tag;
-
-
-
 
     log<LOG_WARNING>(L"%1% || ##################################################################") % __func__  ;
     log<LOG_WARNING>(L"%1% || ####################### PROfit version v%2% ######################") % __func__ % PROJECT_VERSION_STR ;
@@ -967,6 +980,35 @@ int main(int argc, char* argv[])
         }
     }
 
+    // --fit-ratio: resolve channel names and build the collapsed -> ratio map.
+    // Must come after the syst subsetting (which can change GetNSplines) and
+    // before the metric is constructed.
+    PROratio ratiomap;
+    if(fit_ratio_args.size()) {
+        if(fit_ratio_args.size() % 2 != 0) {
+            log<LOG_ERROR>(L"%1% || --fit-ratio expects pairs of channel names, got %2% arguments.") % __func__ % fit_ratio_args.size();
+            return 1;
+        }
+        if(chi2 == "Poisson") {
+            log<LOG_ERROR>(L"%1% || --fit-ratio is incompatible with the Poisson metric: a ratio of Poisson counts is not Poisson distributed.") % __func__;
+            return 1;
+        }
+        const int rvar = fit_ratio_var < 0 ? (int)config.i_prime : fit_ratio_var;
+        if(rvar != (int)config.i_prime) {
+            log<LOG_ERROR>(L"%1% || --fit-ratio-var %2% requested but metrics are built on i_prime (%3%) only.") % __func__ % rvar % config.i_prime;
+            return 1;
+        }
+        std::vector<RatioSpec> specs;
+        for(size_t i = 0; i < fit_ratio_args.size(); i += 2)
+            specs.push_back({fit_ratio_args[i], fit_ratio_args[i+1]});
+        try {
+            ratiomap = PROratio(config, specs, rvar);
+        } catch(const std::exception &e) {
+            log<LOG_ERROR>(L"%1% || --fit-ratio: %2%") % __func__ % e.what();
+            return 1;
+        }
+    }
+
     // Empty-bin sanity check: build a default-CV spectrum and look for collapsed bins
     // that would make stat-only / CNP statistics singular (CV<=0) or untrustworthy (CV<1).
     {
@@ -1017,6 +1059,9 @@ int main(int argc, char* argv[])
                 return 1;
             }
         }
+
+        if(!ratiomap.Empty())
+            ratiomap.SetValidBins(data.Spec(), collapsed_cv);
     }
 
     //Pysics parameter input
@@ -1153,6 +1198,16 @@ int main(int argc, char* argv[])
         abort();
     }
 
+    if(!ratiomap.Empty()) {
+        if(chi2 != "PROchi") {
+            log<LOG_ERROR>(L"%1% || --fit-ratio is currently wired for PROchi only (got %2%).") % __func__ % chi2.c_str();
+            return 1;
+        }
+        metric->setRatioMap(&ratiomap);
+        log<LOG_INFO>(L"%1% || Fitting the channel ratio: %2% ratio bins replace %3% event-space bins.")
+            % __func__ % ratiomap.NBins() % config.m_num_variable_bins_total_collapsed[config.i_prime];
+    } 
+    
     // Set color palette for covar and correlation matrices
     set_matrix_palette();
 
@@ -1227,7 +1282,10 @@ int main(int argc, char* argv[])
         fitres.mh->plot_autocorrelation(final_output_tag+"_PROfile_corrmat_mcmc_autocorrelation.pdf", param_names);
 
         std::string hname = "#chi^{2}/nbins = " + to_string(fitres.chi2) + "/" + to_string(config.m_num_variable_bins_total_collapsed[config.i_prime]);
+        if (ratiomap.Empty())
+            hname = "#chi^{2}/nbins = " + to_string(fitres.chi2) + "/" + to_string(ratiomap.NBins());
         PROspec bf = FillSpectra(config, prop, metric->GetSysts(), metric->GetModel(), fitres.fitter.best_fit, true,config.i_prime);
+
         // Concatenated bins across all channels share no common x-axis, so use bin-index axis.
         TH1D post_hist("ph", hname.c_str(), config.m_num_variable_bins_total_collapsed[config.i_prime], 0, config.m_num_variable_bins_total_collapsed[config.i_prime]);
         TH1D pre_hist("prh", hname.c_str(), config.m_num_variable_bins_total_collapsed[config.i_prime], 0, config.m_num_variable_bins_total_collapsed[config.i_prime]);
@@ -1253,7 +1311,7 @@ int main(int argc, char* argv[])
         }
         if(binwidth_scale) popt |= PlotOptions::BinWidthScaled;
         if(area_normalized) popt |= PlotOptions::AreaNormalized;
-        plot_channels((final_output_tag+"_PROfile_hists.pdf"), config, cv, bf, data, fitres.err_band, fitres.post_err_band, texts, pbounds, popt);
+        plot_channels((final_output_tag+"_PROfile_hists.pdf"), config, cv, bf, data, fitres.err_band, fitres.post_err_band, texts, pbounds, popt, config.i_prime, false, !ratiomap.Empty());
 
         TCanvas c;
         c.Print((final_output_tag+"_postfit_posteriors.pdf[").c_str());
@@ -1691,7 +1749,7 @@ int main(int argc, char* argv[])
                     config, cv_plot, bkg_subchannels, io);
                 cv_plot.Spec() -= bkg_full;
             }
-            plot_channels(final_output_tag+"_PROplot_Variable_"+std::to_string(io)+"_CV.pdf", config, cv_plot, {}, {}, {}, {}, notext, pbounds, opt, io);
+            plot_channels(final_output_tag+"_PROplot_Variable_"+std::to_string(io)+"_CV.pdf", config, cv_plot, {}, {}, {}, {}, notext, pbounds, opt, io, false, plot_channel_ratios);
         }
 
         std::string filename = final_output_tag+"_fractional_systematics.pdf";
@@ -1699,6 +1757,10 @@ int main(int argc, char* argv[])
         std::string rfilename = final_output_tag+"_ratio_fractional_systematics.pdf";
         if(config.m_num_detectors > 1)
             plotPriorFractionalSystematicRatios(config, variable_cvs[config.i_prime], allcovsyst, rfilename,config.i_prime);
+
+        std::string crfilename = final_output_tag+"_channel_ratio_fractional_systematics.pdf";
+        if(plot_channel_ratios && config.m_num_channels > 1)
+            plotPriorFractionalSystematicChannelRatios(config, variable_cvs[config.i_prime], allcovsyst, crfilename, config.i_prime);
 
         std::vector<std::map<std::string, std::unique_ptr<TH1D>>> other_hists;
         for(size_t io = 0; io < config.m_num_variables; ++io) {
@@ -2272,7 +2334,7 @@ int main(int argc, char* argv[])
                 // errband_plot.covariance intentionally unchanged.
             }
             plot_channels(final_output_tag+"_PROplot_Variable_"+std::to_string(io)+"_ErrorBand.pdf", config, cv_plot, {}, data_plot,
-                    errband_plot, {}, other_channel_chitexts[io], pbounds, opt | PlotOptions::DataMCRatio, io);
+                    errband_plot, {}, other_channel_chitexts[io], pbounds, opt | PlotOptions::DataMCRatio, io, false, plot_channel_ratios);
         }
 
 
@@ -2673,7 +2735,7 @@ int main(int argc, char* argv[])
         }
         if(binwidth_scale) popt |= PlotOptions::BinWidthScaled;
         if(area_normalized) popt |= PlotOptions::AreaNormalized;
-        plot_channels((final_output_tag+"_PROglobal_hists.pdf"), config, cv, bf, data, fitres.err_band, fitres.post_err_band, texts, pbounds, popt, 0, true);
+        plot_channels((final_output_tag+"_PROglobal_hists.pdf"), config, cv, bf, data, fitres.err_band, fitres.post_err_band, texts, pbounds, popt, 0, true, !ratiomap.Empty());
     }
 
     if(*promcmc_command) {

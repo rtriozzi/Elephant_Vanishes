@@ -26,6 +26,7 @@
 #include "PROmodel.h"
 #include "PROmetric.h"
 #include "PROcess.h"
+#include "PROratio.h"
 
 namespace PROfit{
 
@@ -52,6 +53,7 @@ namespace PROfit{
             const PROsyst *syst;      ///< Systematic object (non-owning pointer; may be swapped via override_systs).
             const PROmodel &model;    ///< Physics oscillation model (non-owning reference).
             const PROdata data;       ///< Observed data spectrum (owned copy, collapsed to channel level).
+            const PROratio *ratiomap = nullptr; ///< When set and non-empty, chi2 is computed on the channel ratio.
             EvalStrategy strat;       ///< Evaluation strategy (EventByEvent, BinnedGrad, or BinnedChi2).
             bool shape_only;          ///< If true, the chi-squared is computed on area-normalised spectra.
             std::vector<float> physics_param_fixed; ///< Values to hold fixed physics parameters at; empty = none fixed.
@@ -93,8 +95,9 @@ namespace PROfit{
 
             /** @brief Return a heap-allocated copy of this PROchi. */
             virtual PROmetric *Clone() const {
-                 return new PROchi(model_tag, config, peller, syst, model, data, strat, shape_only, physics_param_fixed);
-
+                PROchi *c = new PROchi(model_tag, config, peller, syst, model, data, strat, shape_only, physics_param_fixed);
+                c->ratiomap = ratiomap;
+                return c;
             }
 
             /** @brief Return a const reference to the oscillation model. */
@@ -113,13 +116,15 @@ namespace PROfit{
                 fs_cache.invalidate();
             }
 
+            virtual void setRatioMap(const PROratio *r) { ratiomap = r; }
+
             /**
              * @brief Compute the Gaussian pull penalty for the spline nuisance parameters.
              * @param systs  Spline nuisance parameter values.
              * @return Scalar chi-squared penalty from Gaussian priors.
              */
             virtual float Pull(const Eigen::VectorXf &systs);
-
+            
             /**
              * @brief Fix a specific spline nuisance parameter at a given value.
              * @param fix    0-based spline index.

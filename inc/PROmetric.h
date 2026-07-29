@@ -21,6 +21,8 @@
 
 namespace PROfit {
 
+    class PROratio;
+
     /**
      * @brief Abstract base class for PROfit chi-squared metrics passed to the optimiser.
      * @details Defines the interface required by PROfitter: parameter bounds, fixed-parameter
@@ -87,6 +89,9 @@ namespace PROfit {
 
             /** @brief Replace the internal systematic object pointer with @p new_syst. */
             virtual void override_systs(const PROsyst &new_syst) = 0;
+            /** @brief Attach an optional channel-ratio map. Metrics that do not
+             *  support ratio fitting ignore this. */
+            virtual void setRatioMap(const PROratio *) {}
             /**
              * @brief Evaluate the chi-squared and its gradient.
              * @param param     Current parameter vector.

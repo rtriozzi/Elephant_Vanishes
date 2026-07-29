@@ -140,11 +140,32 @@ float PROchi::operator()(const Eigen::VectorXf &param, Eigen::VectorXf &gradient
     // Per-call: reduced_collapsed_full_covariance depends on `result` via collapsed_full_covariance.
     Eigen::MatrixXf reduced_collapsed_full_covariance = collapsed_full_covariance(idx, idx);
 
-    Eigen::MatrixXf M = reduced_collapsed_stat_covariance + reduced_collapsed_full_covariance;
-
-    // Create reduced delta vector
     Eigen::VectorXf collapsed_mc_spec = CollapseMatrix(config, result.Spec());
-    Eigen::VectorXf delta = collapsed_mc_spec(idx) - normdata(idx);
+
+    const bool use_ratio = (ratiomap && !ratiomap->Empty());
+
+    // when fitting the ratio, empty collapsed bins cannot be dropped
+    Eigen::MatrixXf M;
+    Eigen::VectorXf delta;
+    if(use_ratio) {
+        const Eigen::VectorXf statdiag = normdata.array().cwiseMax(1.0f);
+        const Eigen::MatrixXf M_event =
+            Eigen::MatrixXf(statdiag.asDiagonal()) + collapsed_full_covariance;
+        const Eigen::MatrixXf CR = ratiomap->PropagateCovariance(collapsed_mc_spec, M_event);
+        const Eigen::VectorXf Rp = ratiomap->Apply(collapsed_mc_spec);
+        const Eigen::VectorXf Rd = ratiomap->Apply(normdata);
+        const std::vector<Eigen::Index> &keep = ratiomap->ValidBins();
+        const Eigen::Index nr = (Eigen::Index)keep.size();
+        M     = Eigen::MatrixXf(nr, nr);
+        delta = Eigen::VectorXf(nr);
+        for(Eigen::Index i = 0; i < nr; ++i) {
+            delta(i) = Rp(keep[i]) - Rd(keep[i]);
+            for(Eigen::Index j = 0; j < nr; ++j) M(i,j) = CR(keep[i], keep[j]);
+        }
+    } else {
+        M     = reduced_collapsed_stat_covariance + reduced_collapsed_full_covariance;
+        delta = collapsed_mc_spec(idx) - normdata(idx);
+    }
 
     float pull = Pull(subvector2);
     // delta^T M^-1 delta via Cholesky solve: faster + more stable than forming the inverse.
@@ -223,7 +244,16 @@ float PROchi::operator()(const Eigen::VectorXf &param, Eigen::VectorXf &gradient
             PROspec rl = FillSpectra(config, peller, *syst, model, param_at, fs_cache,
                                      strat != EventByEvent, config.i_prime);
             Eigen::VectorXf cmcl = CollapseMatrix(config, rl.Spec());
-            delta_out = cmcl(idx) - normdata(idx);
+            if(use_ratio) {
+                const Eigen::VectorXf Rp = ratiomap->Apply(cmcl);
+                const Eigen::VectorXf Rd = ratiomap->Apply(normdata);
+                const std::vector<Eigen::Index> &keep = ratiomap->ValidBins();
+                delta_out = Eigen::VectorXf((Eigen::Index)keep.size());
+                for(size_t k = 0; k < keep.size(); ++k)
+                    delta_out((Eigen::Index)k) = Rp(keep[k]) - Rd(keep[k]);
+            } else {
+                delta_out = cmcl(idx) - normdata(idx);
+            }
             return true;
         };
 
@@ -240,9 +270,27 @@ float PROchi::operator()(const Eigen::VectorXf &param, Eigen::VectorXf &gradient
             Eigen::MatrixXf cfcl  = CollapseMatrix(config, fcl);
             Eigen::MatrixXf gM_lo = reduced_collapsed_stat_covariance + cfcl(idx, idx);
             Eigen::VectorXf cmcl  = CollapseMatrix(config, rl.Spec());
-            Eigen::VectorXf dl    = cmcl(idx) - normdata(idx);
             Eigen::VectorXf nuis  = param_at.segment(model.nparams, syst->GetNSplines());
-            chi2_out = dl.dot(gM_lo.llt().solve(dl)) + Pull(nuis);
+            if(use_ratio) {
+                const Eigen::VectorXf statdiag = normdata.array().cwiseMax(1.0f);
+                const Eigen::MatrixXf M_event = Eigen::MatrixXf(statdiag.asDiagonal()) + cfcl;
+                const Eigen::MatrixXf CRl = ratiomap->PropagateCovariance(cmcl, M_event);
+                const Eigen::VectorXf Rp = ratiomap->Apply(cmcl);
+                const Eigen::VectorXf Rd = ratiomap->Apply(normdata);
+                const std::vector<Eigen::Index> &keep = ratiomap->ValidBins();
+                const Eigen::Index nr = (Eigen::Index)keep.size();
+                Eigen::MatrixXf Ml(nr, nr);
+                Eigen::VectorXf dl(nr);
+                for(Eigen::Index a = 0; a < nr; ++a) {
+                    dl(a) = Rp(keep[a]) - Rd(keep[a]);
+                    for(Eigen::Index b = 0; b < nr; ++b) Ml(a,b) = CRl(keep[a], keep[b]);
+                }
+                chi2_out = dl.dot(Ml.llt().solve(dl)) + Pull(nuis);
+            } else {
+                Eigen::MatrixXf gM_lo = reduced_collapsed_stat_covariance + cfcl(idx, idx);
+                Eigen::VectorXf dl    = cmcl(idx) - normdata(idx);
+                chi2_out = dl.dot(gM_lo.llt().solve(dl)) + Pull(nuis);
+            }
             return true;
         };
 
